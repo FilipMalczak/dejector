@@ -1,11 +1,11 @@
 {
-	"name": "dejector",
+	"name": "glue-dejector",
 	"description": "Proof of concept D Dependency Injection Framework",
 	"license": "MIT",
-	"homepage": "https://github.com/jstasiak/dejector",
+	"homepage": "https://github.com/FilipMalczak/dejector",
 	"copyright": "Copyright © 2013, Jakub Stasiak",
 	"authors": [
-		"Jakub Stasiak"
+		"Jakub Stasiak", "Filip Malczak"
 	],
 	"targetType": "library",
 	"dependencies": {

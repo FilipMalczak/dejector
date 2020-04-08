@@ -1,65 +1,107 @@
-import std.conv : to;
 import std.functional : toDelegate;
-import std.stdio : writefln;
-import std.string : chomp;
-import std.traits : fullyQualifiedName, hasMember, moduleName, ParameterTypeTuple;
-
+import std.meta: staticMap, Alias;
+import std.string : join;
+import std.traits : fullyQualifiedName, hasMember, moduleName, ParameterTypeTuple, Parameters;
 
 extern (C) Object _d_newclass(const TypeInfo_Class ci);
 
-private immutable argumentSeparator = ", ";
-
-private string generateGet(T)() {
-    immutable nameOfT = fullyQualifiedName!T;
-    auto code = "
-        Object get(string key, ref Object[string] known) {
-            auto instance = cast(T) _d_newclass(T.classinfo);
-            known[key] = instance;";
-
-
-    static if (hasMember!(T, "__ctor")) {
-        foreach (type; ParameterTypeTuple!(T.__ctor)) {
-            code ~= "import " ~ moduleName!type ~ ";";
-        }
-
-        code ~= "instance.__ctor(";
-
-        foreach (type; ParameterTypeTuple!(T.__ctor)) {
-            code ~= "this.dej.get!(" ~ fullyQualifiedName!type ~ ")(known)" ~
-                argumentSeparator;
-        }
-        code = chomp(code, argumentSeparator) ~ ");";
+void traceWiring(T...)(T t){
+    version(dejector_trace) {
+        import std.stdio: writeln;
+        writeln(t);
     }
-    code ~= "return instance; }";
-    return code;
 }
 
+interface Initializer {
+    void initialize(Object o);
+}
+
+class NullInitializer: Initializer {
+    override void initialize(Object o){
+        traceWiring("Null initialize instance ", &o);
+    }
+}
+
+class Initialization {
+    Object instance;
+    bool performed;
+    Initializer initializer;
+    
+    this(Object instance, bool performed, Initializer initializer){
+        this.instance = instance;
+        this.performed = performed;
+        this.initializer = initializer;
+    }
+    
+    Initialization ensureInitialized (){
+        if (!performed){
+            traceWiring("Initializing ", &instance);
+            performed = true;
+            initializer.initialize(instance);
+            traceWiring("Initialized ", &instance);
+        } {
+            traceWiring("Already initialized", &instance);
+        }
+        return this;
+    }
+}
 
 interface Provider {
-    Object get(string key, ref Object[string] known);
+    Initialization get();
 }
 
+private string callCtor(T)(){
+    string result;
+    static foreach (t; Parameters!(T.__ctor)){
+        result ~= "import "~moduleName!t~";\n";
+    }
+    string[] params;
+    static foreach (t; Parameters!(T.__ctor)){
+        params ~= "this.dej.get!("~fullyQualifiedName!t~")()";
+    }
+    result ~= "(cast(T) instance).__ctor("~(params.join(", "))~");";
+    return result;
+}
+
+class ClassInitializer(T): Initializer {
+    private Dejector dej;
+    this(Dejector dejector) {
+        this.dej = dejector;
+    }
+
+    override void initialize(Object instance){
+        static if (hasMember!(T, "__ctor")) {
+            traceWiring("Calling constructor for instance ", &instance, " of type ", fullyQualifiedName!T);
+            mixin(callCtor!T());
+            traceWiring("Called constructor for ", &instance);
+        }
+    }
+}
 
 class ClassProvider(T) : Provider {
     private Dejector dej;
     this(Dejector dejector) {
         this.dej = dejector;
     }
-    mixin(generateGet!T);
+    
+    override Initialization get(){
+        traceWiring("Building instance of type ", fullyQualifiedName!T);
+        auto instance = cast(T) _d_newclass(T.classinfo);
+        traceWiring("Built uninitialized instance ", &instance, " of type ", fullyQualifiedName!T);
+        return new Initialization(instance, false, new ClassInitializer!T(dej));
+    }
 }
 
 
 class FunctionProvider : Provider {
-    private Object delegate(ref Object[string]) provide;
+    private Object delegate() provide;
 
-    this(Object delegate(ref Object[string]) provide) {
+    this(Object delegate() provide) {
         this.provide = provide;
     }
 
-    Object get(string key, ref Object[string] known) {
-        auto v = this.provide(known);
-        known[key] = v;
-        return v;
+    Initialization get() {
+        return new Initialization(provide(), true, new NullInitializer);
     }
 }
 
@@ -71,50 +113,39 @@ class InstanceProvider : Provider {
         this.instance = instance;
     }
 
-    Object get(string key, ref Object[string] known) {
-        known[key] = this.instance;
-        return this.instance;
+    Initialization get() {
+        return new Initialization(instance, true, new NullInitializer);
     }
 }
 
 
-private struct Binding {
-    string key;
-    Provider provider;
-    Scope scope_;
-}
-
-
 interface Scope {
-    Object get(string key, Provider provider, ref Object[string] known);
+    Object get(string key, Provider provider);
 }
 
 //todo IMO it's Prototype
 class NoScope : Scope {
-    Object get(string key, Provider provider, ref Object[string] known) {
-        import std.stdio;
-        import std.conv;
-        writeln("NoScope key "~key~" "~to!string(known), key);
-        auto o = provider.get(key, known);
-        writeln("RETURN NEW ", to!string(&o), key);
-        return o;
+    Object get(string key, Provider provider) {
+        traceWiring("NoScope for key ", key);
+        return provider.get().ensureInitialized.instance;
     }
 }
 
 class Singleton : Scope {
     private Object[string] instances;
 
-    Object get(string key, Provider provider, ref Object[string] known) {
-        import std.stdio;
-        writeln("Singleton key "~key~" "~to!string(known));
-        auto found = key in known;
-        if (found){
-            writeln("ALREADY KNOWN ", key);
-            return known[key];
-        }
+    Object get(string key, Provider provider) {
+        traceWiring("Singleton for key ", key);
         if(key !in this.instances) {
-            this.instances[key] = provider.get(key, known);
+            traceWiring("Not cached for key ", key);
+            auto i = provider.get();
+            this.instances[key] = i.instance;
+            traceWiring("Cached ", key, " with ", &(i.instance));
+            i.ensureInitialized;
+        } else {
+            traceWiring("Already cached ", key);
         }
+        traceWiring("Singleton ", key, " -> ", key in instances);
         return this.instances[key];
     }
 }
@@ -126,6 +157,12 @@ interface Module {
 
 
 class Dejector {
+    private struct Binding {
+        string key;
+        Provider provider;
+        Scope scope_;
+    }
+
     private Binding[string] bindings;
     private Scope[string] scopes;
 
@@ -150,15 +187,15 @@ class Dejector {
         this.scopes[key] = new Class();
     }
 
-    void bind(Class, ScopeClass:Scope = NoScope)() {
+    void bind(Class, ScopeClass:Scope = Singleton)() {
         this.bind!(Class, Class, ScopeClass);
     }
 
-    void bind(Interface, Class, ScopeClass:Scope = NoScope)() {
+    void bind(Interface, Class, ScopeClass:Scope = Singleton)() {
         this.bind!(Interface, ScopeClass)(new ClassProvider!Class(this));
     }
 
-    void bind(Interface, ScopeClass:Scope = NoScope)(Provider provider) {
+    void bind(Interface, ScopeClass:Scope = Singleton)(Provider provider) {
         immutable key = fullyQualifiedName!Interface;
         if(key in this.bindings) {
             throw new Exception("Interface already bound");
@@ -167,33 +204,25 @@ class Dejector {
         this.bindings[key] = Binding(key, provider, scope_);
     }
 
-    void bind(Interface, ScopeClass:Scope = NoScope)(Object delegate(ref Object[string]) provide) {
+    void bind(Interface, ScopeClass:Scope = Singleton)(Object delegate() provide) {
         this.bind!(Interface, ScopeClass)(new FunctionProvider(provide));
     }
 
-    void bind(Interface, ScopeClass:Scope = NoScope)(Object function(ref Object[string]) provide) {
+    void bind(Interface, ScopeClass:Scope = Singleton)(Object function() provide) {
         this.bind!(Interface, ScopeClass)(toDelegate(provide));
     }
-    
-    private static Object[string] emptyKnown;
 
     Interface get(Interface)() {
-        Object[string] known;
-        return get!(Interface)(known);
+        return get!(Interface, Interface)();
     }
 
-    Interface get(Interface)(ref Object[string] known) {
-        return get!(Interface, Interface)(known);
-    }
-
+    //todo a beature - a bug that is a feature; since there is no Class: Interface declaration
+    //in bind signature, it may happen, that we register two unrelated types together
+    //that seems like a bug, but actually we can implement qualifiers thanks to
+    //that, so I also call it a feature and extend API to allow for that
     Interface get(Query, Interface)() {
-        Object[string] known;
-        return get!(Query, Interface)(known);
-    }
-
-    Interface get(Query, Interface)(ref Object[string] known) {
         auto binding = this.bindings[fullyQualifiedName!Query];
         immutable key = fullyQualifiedName!Query;
-        return cast(Interface) binding.scope_.get(key, binding.provider, known);
+        return cast(Interface) binding.scope_.get(key, binding.provider);
     }
 }
