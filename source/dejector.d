@@ -155,15 +155,37 @@ interface Module {
     void configure(Dejector dejector);
 }
 
+class DejectorException: Exception {
+    this(string msg = null, Throwable next = null) { 
+        super(msg, next);
+    }
+    this(string msg, string file, size_t line, Throwable next = null) {
+        super(msg, file, line, next);
+    }
+}
 
 class Dejector {
+    private enum isObjectType(T) = is(T == interface) || is(T == class);
+    private enum isValueType(T) = is(T == struct) || is(T==enum);
+    template key(alias T) {
+        static if (isObjectType!T){
+            enum key = fullyQualifiedName!T;
+        } else {
+            static if (typeof(T).isValueType)
+                enum key = moduleName!T~"."~T;
+            else 
+                static assert(false, "Only object types or values can be keys");
+        } 
+    }
     private struct Binding {
         string key;
         Provider provider;
         Scope scope_;
     }
-
-    private Binding[string] bindings;
+    
+    alias BindingResolver = Binding delegate();
+    
+    private BindingResolver[string] resolvers;
     private Scope[string] scopes;
 
     this(Module[] modules) {
@@ -180,49 +202,84 @@ class Dejector {
     }
 
     void bindScope(Class)() {
-        immutable key = fullyQualifiedName!Class;
+        immutable key = key!Class;
         if(key in this.scopes) {
-            throw new Exception("Scope already bound");
+            throw new DejectorException("Scope "~key~" already bound");
         }
         this.scopes[key] = new Class();
     }
 
-    void bind(Class, ScopeClass:Scope = Singleton)() {
-        this.bind!(Class, Class, ScopeClass);
-    }
-
-    void bind(Interface, Class, ScopeClass:Scope = Singleton)() {
-        this.bind!(Interface, ScopeClass)(new ClassProvider!Class(this));
-    }
-
-    void bind(Interface, ScopeClass:Scope = Singleton)(Provider provider) {
-        immutable key = fullyQualifiedName!Interface;
-        if(key in this.bindings) {
-            throw new Exception("Interface already bound");
+    void bind(string alias_, string for_, bool lazy_=true) {
+        if (alias_ in this.resolvers) {
+            throw new DejectorException("Alias "~alias_~" for "~for_~"already bound!");
         }
-        auto scope_ = this.scopes[fullyQualifiedName!ScopeClass];
-        this.bindings[key] = Binding(key, provider, scope_);
+        if (lazy_){
+            this.resolvers[alias_] = () => resolveBinding(for_);
+        } else {
+            auto val = resolveBinding(for_);
+            this.resolvers[alias_] = () => val;
+        }
+    }
+    
+    void bind(Qualifier)(Qualifier qualifier, string for_) if (isValueType!Qualifier) {
+        bind(key!qualifier, for_);
+    }
+    
+    void bind(Qualifier)(string for_) if (isObjectType!Qualifier) {
+        bind(key!Qualifier, for_);
+    }
+    
+    void bind(Type, Class, ScopeClass:Scope = Singleton)() if (isObjectType!Type && isObjectType!Class) {
+        static if (is(Class == class))
+            this.bind!(Class, ScopeClass)();
+        this.bind!(Type)(() => resolveBinding(key!Class));
+    }
+    
+    private void bind(Type)(BindingResolver resolver) if (isObjectType!Type) {
+        immutable key = key!Type;
+        if (key in this.resolvers) {
+            throw new DejectorException("Type "~key~" already bound!");
+        }
+        this.resolvers[key] = resolver;
     }
 
-    void bind(Interface, ScopeClass:Scope = Singleton)(Object delegate() provide) {
-        this.bind!(Interface, ScopeClass)(new FunctionProvider(provide));
+    void bind(Type, ScopeClass:Scope = Singleton)(Provider provider) if (isObjectType!Type) {
+        if (!(key!ScopeClass in this.scopes))
+            throw new DejectorException("Unknown scope "~key!ScopeClass);
+        auto scope_ = this.scopes[key!ScopeClass];
+        this.bind!(Type)(() => Binding(key!Type, provider, scope_));
+    }
+    
+    void bind(Class, ScopeClass:Scope = Singleton)() if (is(Class == class)){
+        this.bind!(Class, ScopeClass)(new ClassProvider!Class(this));
+    }
+    
+    void bind(Type, ScopeClass:Scope = Singleton)(Object delegate() provide) if (isObjectType!Type) {
+        this.bind!(Type, ScopeClass)(new FunctionProvider(provide));
     }
 
-    void bind(Interface, ScopeClass:Scope = Singleton)(Object function() provide) {
-        this.bind!(Interface, ScopeClass)(toDelegate(provide));
+    void bind(Type, ScopeClass:Scope = Singleton)(Object function() provide) if (isObjectType!Type) {
+        this.bind!(Type, ScopeClass)(toDelegate(provide));
     }
 
-    Interface get(Interface)() {
-        return get!(Interface, Interface)();
+    Type get(Type)() {
+        return get!(Type)(key!Type);
     }
 
-    //todo a beature - a bug that is a feature; since there is no Class: Interface declaration
-    //in bind signature, it may happen, that we register two unrelated types together
-    //that seems like a bug, but actually we can implement qualifiers thanks to
-    //that, so I also call it a feature and extend API to allow for that
-    Interface get(Query, Interface)() {
-        auto binding = this.bindings[fullyQualifiedName!Query];
-        immutable key = fullyQualifiedName!Query;
-        return cast(Interface) binding.scope_.get(key, binding.provider);
+    Type get(Query, Type)() {
+        return get!(Type)(key!Query);
+    }
+    
+    private Binding resolveBinding(string query){
+        return this.resolvers[query]();
+    }
+    
+    Type get(Type)(string query){
+        auto binding = resolveBinding(query);
+        return cast(Type) binding.scope_.get(query, binding.provider); 
+    }
+    
+    string resolveQuery(string query){
+        return this.resolvers[query]().key;
     }
 }
