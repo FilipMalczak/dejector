@@ -10,5 +10,8 @@
 	"targetType": "library",
 	"dependencies": {
 		"dunit": ">=1.0.8"
-	}
+	},
+	"_versions": [
+	    "dejector_trace"
+	]
 }

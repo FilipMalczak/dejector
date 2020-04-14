@@ -164,31 +164,101 @@ class DejectorException: Exception {
     }
 }
 
+private enum isObjectType(T) = is(T == interface) || is(T == class);
+private enum isValueType(T) = is(T == struct) || is(T==enum);
+
+string queryString(T)() if (isObjectType!T) {
+    return fullyQualifiedName!T;
+}
+
+string queryString(T)(T t) if (is(T == struct)) {
+    import std.conv: to;
+    return moduleName!T~"."~to!string(t);
+}
+
+string queryString(T)(T t) if (is(T == enum)) {
+    import std.conv: to;
+    return fullyQualifiedName!T~"."~to!string(t);
+}
+
 class Dejector {
-    private enum isObjectType(T) = is(T == interface) || is(T == class);
-    private enum isValueType(T) = is(T == struct) || is(T==enum);
-    template key(alias T) {
-        static if (isObjectType!T){
-            enum key = fullyQualifiedName!T;
-        } else {
-            static if (typeof(T).isValueType)
-                enum key = moduleName!T~"."~T;
-            else 
-                static assert(false, "Only object types or values can be keys");
-        } 
-    }
     private struct Binding {
         string key;
         Provider provider;
         Scope scope_;
+        
+        Object get(){
+            return scope_.get(key, provider);
+        }
     }
     
-    alias BindingResolver = Binding delegate();
+    private interface BindingResolver {
+        Binding resolve();
+    }
     
-    private BindingResolver[string] resolvers;
+    private class ExplicitResolver: BindingResolver {
+        private Binding binding;
+        
+        this(Binding binding){
+            this.binding = binding;
+        }
+        
+        override Binding resolve(){
+            traceWiring("Resolving explicit binding for key "~key);
+            return binding;
+        }
+        
+        override string toString(){
+            return typeof(this).stringof~"(key="~key~")";
+        }
+        
+        @property
+        string key(){
+            return binding.key;
+        }
+    }
+    
+    private class AliasResolver: BindingResolver {
+        private ResolverMapping resolvers;
+        private string aliasName;
+        private string aliasTarget;
+        
+        this(ResolverMapping resolvers, string aliasName, string aliasTarget){
+            this.resolvers = resolvers;
+            this.aliasName = aliasName;
+            this.aliasTarget = aliasTarget;
+        }
+        
+        override Binding resolve(){
+            traceWiring("Resolving alias "~aliasName~" -> "~aliasTarget);
+            return resolvers.backend[aliasTarget].resolve();
+        }
+        
+        override string toString(){
+            import std.conv: to;
+            return typeof(this).stringof~"("~aliasName~" -> "~aliasTarget~"; {"~to!string(&resolvers)~"})";
+        }
+        
+        BindingAlias toBindingAlias(){
+            return BindingAlias(aliasName, aliasTarget);
+        }
+    }
+    
+    private class ResolverMapping {
+        private BindingResolver[string] backend;
+        
+        override string toString(){
+            import std.conv: to;
+            return typeof(this).stringof~"("~to!string(backend)~")";
+        }
+    }
+    
+    //todo private; public for debugging
+    ResolverMapping resolvers;
     private Scope[string] scopes;
 
     this(Module[] modules) {
+        resolvers = new ResolverMapping();
         this.bindScope!NoScope;
         this.bindScope!Singleton;
 
@@ -200,54 +270,89 @@ class Dejector {
     this() {
         this([]);
     }
-
-    void bindScope(Class)() {
-        immutable key = key!Class;
-        if(key in this.scopes) {
-            throw new DejectorException("Scope "~key~" already bound");
+    
+    struct BindingAlias {string name; string target;}
+    
+    @property
+    string[] allQueries(){
+        return resolvers.backend.keys();
+    }
+    
+    @property
+    string[] allConcreteTypeQueries(){
+        string[] result;
+        foreach (r; resolvers.backend.values()){
+            ExplicitResolver r2 = cast(ExplicitResolver) r;
+            if (r2 !is null){
+                result ~= r2.key;
+            }
         }
-        this.scopes[key] = new Class();
+        return result;
+    }
+    
+    @property
+    BindingAlias[] aliasing(){
+        BindingAlias[] result;
+        foreach (r; resolvers.backend.values()){
+            AliasResolver r2 = cast(AliasResolver) r;
+            if (r2 !is null){
+                result ~= r2.toBindingAlias;
+            }
+        }
+        return result;
     }
 
-    void bind(string alias_, string for_, bool lazy_=true) {
-        if (alias_ in this.resolvers) {
+    void bindScope(Class)() {
+        immutable scopeQuery = queryString!Class();
+        if(scopeQuery in this.scopes) {
+            throw new DejectorException("Scope "~scopeQuery~" already bound");
+        }
+        this.scopes[scopeQuery] = new Class();
+    }
+
+    void bind(string alias_, string for_) {
+        if (alias_ in this.resolvers.backend) {
             throw new DejectorException("Alias "~alias_~" for "~for_~"already bound!");
         }
-        if (lazy_){
-            this.resolvers[alias_] = () => resolveBinding(for_);
-        } else {
-            auto val = resolveBinding(for_);
-            this.resolvers[alias_] = () => val;
-        }
+        this.resolvers.backend[alias_] = new AliasResolver(resolvers, alias_, for_);
     }
     
     void bind(Qualifier)(Qualifier qualifier, string for_) if (isValueType!Qualifier) {
-        bind(key!qualifier, for_);
+        bind(queryString(qualifier), for_);
     }
     
     void bind(Qualifier)(string for_) if (isObjectType!Qualifier) {
-        bind(key!Qualifier, for_);
+        bind(queryString!Qualifier(), for_);
+    }
+    
+    void bind(Qualifier, Class, ScopeClass:Scope = Singleton)(Qualifier qualifier) if (isValueType!Qualifier) {
+        import std.algorithm;
+        if (is(Class == class) && !allConcreteTypeQueries.canFind(queryString!Class))
+            this.bind!(Class, ScopeClass)();
+        bind(queryString(qualifier), queryString!Class);
     }
     
     void bind(Type, Class, ScopeClass:Scope = Singleton)() if (isObjectType!Type && isObjectType!Class) {
-        static if (is(Class == class))
+        import std.algorithm;
+        if (is(Class == class) && !allConcreteTypeQueries.canFind(queryString!Class))
             this.bind!(Class, ScopeClass)();
-        this.bind!(Type)(() => resolveBinding(key!Class));
+            
+        this.bind!(Type)(queryString!Class());
     }
     
     private void bind(Type)(BindingResolver resolver) if (isObjectType!Type) {
-        immutable key = key!Type;
-        if (key in this.resolvers) {
-            throw new DejectorException("Type "~key~" already bound!");
+        immutable query = queryString!Type();
+        if (query in this.resolvers.backend) {
+            throw new DejectorException("Type "~query~" already bound!");
         }
-        this.resolvers[key] = resolver;
+        this.resolvers.backend[query] = resolver;
     }
 
     void bind(Type, ScopeClass:Scope = Singleton)(Provider provider) if (isObjectType!Type) {
-        if (!(key!ScopeClass in this.scopes))
-            throw new DejectorException("Unknown scope "~key!ScopeClass);
-        auto scope_ = this.scopes[key!ScopeClass];
-        this.bind!(Type)(() => Binding(key!Type, provider, scope_));
+        if (!(queryString!ScopeClass() in this.scopes))
+            throw new DejectorException("Unknown scope "~queryString!ScopeClass());
+        auto scope_ = this.scopes[queryString!ScopeClass()];
+        this.bind!(Type)(new ExplicitResolver(Binding(queryString!Type(), provider, scope_)));
     }
     
     void bind(Class, ScopeClass:Scope = Singleton)() if (is(Class == class)){
@@ -263,23 +368,34 @@ class Dejector {
     }
 
     Type get(Type)() {
-        return get!(Type)(key!Type);
+        return get!(Type)(queryString!Type());
     }
 
-    Type get(Query, Type)() {
-        return get!(Type)(key!Query);
+    Type get(Query, Type)() if (isObjectType!Query) {
+        return get!(Type)(queryString!Query());
+    }
+    
+    Type get(Qualifier, Type)(Qualifier qualifier) if (isValueType!Qualifier) {
+        return get!(Type)(queryString(qualifier));
     }
     
     private Binding resolveBinding(string query){
-        return this.resolvers[query]();
+        return this.resolvers.backend[query].resolve();
     }
     
     Type get(Type)(string query){
+        import std.algorithm: canFind;
+        if (!allQueries.canFind(query))
+            return null;
         auto binding = resolveBinding(query);
-        return cast(Type) binding.scope_.get(query, binding.provider); 
+        return cast(Type) binding.get(); 
+    }
+    
+    string resolveQuery(Type)(){
+        return resolveQuery(queryString!Type());
     }
     
     string resolveQuery(string query){
-        return this.resolvers[query]().key;
+        return this.resolvers.backend[query].resolve().key;
     }
 }

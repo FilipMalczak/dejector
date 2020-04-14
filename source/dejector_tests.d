@@ -1,4 +1,6 @@
-import dejector : Dejector, InstanceProvider, Module, NoScope, Singleton;
+import dejector : Dejector, InstanceProvider, Module, NoScope, Singleton, queryString;
+
+import std.stdio;
 
 version(unittest) {
     class X {}
@@ -35,6 +37,15 @@ version(unittest) {
 
         auto user = dejector.get!User;
         assert(user.name == "root");
+        
+        auto resolved = dejector.resolveQuery!Greeter();
+        assert(resolved == queryString!(GreeterImplementation));
+        auto byConcrete = dejector.get!GreeterImplementation();
+        assert(greeter == byConcrete);
+        assert(greeter is byConcrete);
+        assert(dejector.allConcreteTypeQueries == ["dejector_tests.GreeterImplementation", "dejector_tests.X", "dejector_tests.User"]);
+        assert(dejector.aliasing == [Dejector.BindingAlias("dejector_tests.Greeter", "dejector_tests.GreeterImplementation")]);
+        writeln(__LINE__, " X/User/Greeter passed");
     }
 
     /// InstanceProvider works
@@ -42,6 +53,7 @@ version(unittest) {
         auto dejector = new Dejector;
         dejector.bind!(User)(new InstanceProvider(new User("Jon")));
         assert(dejector.get!User.name == "Jon");
+        writeln(__LINE__, " X/User/Greeter passed");
     }
 
     /// NoScope binding creates new object on every call
@@ -50,6 +62,7 @@ version(unittest) {
         dejector.bind!(X, NoScope);
 
         assert(dejector.get!X() !is dejector.get!X());
+        writeln(__LINE__, " X/User/Greeter passed");
     }
 
     /// Singleton binding always returns the same object
@@ -58,10 +71,9 @@ version(unittest) {
         dejector.bind!(X, Singleton);
 
         assert(dejector.get!X is dejector.get!X);
+        writeln(__LINE__, " X/User/Greeter passed");
     }
 }
-
-import std.stdio;
 
 ///Circular dependencies
 version(unittest){
@@ -242,3 +254,56 @@ version(unittest){
         writeln("A1-A3 passed");
     }
 }
+
+//aliases and qualifiers
+version(unittest) {
+    class C1 {}
+
+    class C2 {}
+
+    class C3 {}
+    
+    class C4 {}
+
+    enum E1 { V1, V2 }
+
+    struct S1 { int x = 0; }
+   
+    class C5 {}
+
+    class ValuesModule: Module {
+        void configure(Dejector dejector) {
+            dejector.bind!C1;
+            dejector.bind("abc", queryString!C1); //todo bind!C1("abc") = alias C1 -> abc
+            dejector.bind!(E1, C2)(E1.V1); //todo bind!(E1.V1, C2)
+            dejector.bind!(S1, C3)(S1(3));
+            dejector.bind!(C5, C4);
+        }
+    }
+
+    unittest {
+        auto dejector = new Dejector([new ValuesModule()]);
+        //fixme order may vary
+        //fixme hardcoded queryString results
+        assert(dejector.aliasing == [
+            Dejector.BindingAlias("dejector_tests.E1.V1", "dejector_tests.C2"), 
+            Dejector.BindingAlias("dejector_tests.S1(3)", "dejector_tests.C3"), 
+            Dejector.BindingAlias("abc", "dejector_tests.C1"), 
+            Dejector.BindingAlias("dejector_tests.C5", "dejector_tests.C4")
+        ]);
+        assert(dejector.allConcreteTypeQueries == [
+            "dejector_tests.C1", 
+            "dejector_tests.C3", 
+            "dejector_tests.C4", 
+            "dejector_tests.C2"
+        ]);
+        assert(dejector.get!Object("abc") is dejector.get!C1); //todo default template param
+        assert(dejector.get!(E1, Object)(E1.V1) is dejector.get!C2); //ditto
+        assert(dejector.get!(E1, Object)(E1.V2) is null);
+        assert(dejector.get!(S1, Object)(S1(3)) is dejector.get!C3); //ditto
+        assert(dejector.get!(S1, Object)(S1()) is null);
+        assert(dejector.get!(C5, Object) is dejector.get!C4);
+        writeln("Values passed");
+    }
+}
+
