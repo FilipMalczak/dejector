@@ -1,6 +1,7 @@
 import dejector : Dejector, InstanceProvider, Module, NoScope, Singleton, queryString;
 
 import std.stdio;
+import std.algorithm;
 
 version(unittest) {
     class X {}
@@ -43,8 +44,12 @@ version(unittest) {
         auto byConcrete = dejector.get!GreeterImplementation();
         assert(greeter == byConcrete);
         assert(greeter is byConcrete);
-        assert(dejector.allConcreteTypeQueries == ["dejector_tests.GreeterImplementation", "dejector_tests.X", "dejector_tests.User"]);
-        assert(dejector.aliasing == [Dejector.BindingAlias("dejector_tests.Greeter", "dejector_tests.GreeterImplementation")]);
+        writeln(dejector.allKeys);
+        auto expectedKeys = ["dejector_tests.GreeterImplementation", "dejector_tests.X", "dejector_tests.User", "dejector_tests.Greeter"];
+        expectedKeys.sort;
+        assert(dejector.allKeys == expectedKeys);
+        assert(dejector.isAlias("dejector_tests.Greeter"));
+        assert(!dejector.isAlias("dejector_tests.GreeterImplementation"));
         writeln(__LINE__, " X/User/Greeter passed");
     }
 
@@ -285,18 +290,18 @@ version(unittest) {
         auto dejector = new Dejector([new ValuesModule()]);
         //fixme order may vary
         //fixme hardcoded queryString results
-        assert(dejector.aliasing == [
-            Dejector.BindingAlias("dejector_tests.E1.V1", "dejector_tests.C2"), 
-            Dejector.BindingAlias("dejector_tests.S1(3)", "dejector_tests.C3"), 
-            Dejector.BindingAlias("abc", "dejector_tests.C1"), 
-            Dejector.BindingAlias("dejector_tests.C5", "dejector_tests.C4")
-        ]);
-        assert(dejector.allConcreteTypeQueries == [
+        auto expectedKeys = [
             "dejector_tests.C1", 
             "dejector_tests.C3", 
             "dejector_tests.C4", 
-            "dejector_tests.C2"
-        ]);
+            "dejector_tests.C2",
+            "dejector_tests.E1.V1",
+            "dejector_tests.S1(3)",
+            "abc",
+            "dejector_tests.C5",
+        ];
+        expectedKeys.sort;
+        assert(dejector.allKeys == expectedKeys);
         assert(dejector.get!Object("abc") is dejector.get!C1); //todo default template param
         assert(dejector.get!(E1, Object)(E1.V1) is dejector.get!C2); //ditto
         assert(dejector.get!(E1, Object)(E1.V2) is null);
@@ -397,6 +402,7 @@ version(unittest) {
         assert(o34 !is o3Third);
         
         //todo test cyclic parent relationship
+        //todo test reporting keys and aliasing
         
         writeln("Inheritance passed");
     }

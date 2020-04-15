@@ -265,10 +265,6 @@ class Dejector {
             import std.conv: to;
             return typeof(this).stringof~"("~aliasName~" -> "~aliasTarget~"; {"~to!string(&resolvers)~"})";
         }
-        
-        BindingAlias toBindingAlias(){
-            return BindingAlias(aliasName, aliasTarget);
-        }
     }
     
     private class ResolverMapping {
@@ -308,7 +304,7 @@ class Dejector {
         return typeof(this).stringof~
                     "(name="~name~
                     ", resolvers.length="~to!string(resolvers.backend.length)~
-                    ", concreteTypes.length="~to!string(allConcreteTypeQueries.length)~
+                    ", allKeys.length="~to!string(allKeys.length)~
                     ", parent="~to!string(_parent)~
                     ")";
     }
@@ -380,41 +376,19 @@ class Dejector {
         }
     }
     
-    struct BindingAlias {string name; string target;}
-    
     @property
-    string[] allNonInheritedQueries(){
-        return resolvers.backend.keys();
-    }
-    
-    @property
-    string[] allConcreteTypeQueries(){
+    string[] allKeys(){
+        import std.algorithm;
         string[] result;
-        foreach (r; resolvers.backend.values()){
-            ExplicitResolver r2 = cast(ExplicitResolver) r;
-            if (r2 !is null){
-                result ~= r2.key;
-            }
-        }
+        result ~= resolvers.backend.keys();
+        if (_parent !is null)
+            foreach (s; _parent.allKeys)
+                if (!result.canFind(s))
+                    result ~= s;
+        result.sort;
         return result;
     }
     
-    //todo shadowedQueries, inheritedQueries, introducedQueried
-    
-    @property
-    BindingAlias[] aliasing(){
-        BindingAlias[] result;
-        foreach (r; resolvers.backend.values()){
-            AliasResolver r2 = cast(AliasResolver) r;
-            if (r2 !is null){
-                result ~= r2.toBindingAlias;
-            }
-        }
-        return result;
-    }
-    
-    //todo shadowed/inherited/introduced aliasing?
-
     void bindScope(Class: Scope)() {
         immutable scopeQuery = queryString!Class();
         if(scopeQuery in this.scopes) {
@@ -460,18 +434,21 @@ class Dejector {
         bind(queryString!Qualifier(), for_);
     }
     
-    void bind(Qualifier, Class, ScopeClass:Scope = Singleton)(Qualifier qualifier) if (isValueType!Qualifier) {
+    void bind(Qualifier, Class, ScopeClass:Scope = Singleton)(Qualifier qualifier, bool bindClass=true) if (isValueType!Qualifier) {
         import std.algorithm;
-        if (is(Class == class) && !allConcreteTypeQueries.canFind(queryString!Class))
+        if (bindClass) {
+            assert(is(Class == class)); //todo proper exception
             this.bind!(Class, ScopeClass)();
+        }
         bind(queryString(qualifier), queryString!Class);
     }
     
-    void bind(Type, Class, ScopeClass:Scope = Singleton)() if (isObjectType!Type && isObjectType!Class) {
+    void bind(Type, Class, ScopeClass:Scope = Singleton)(bool bindClass=true) if (isObjectType!Type && isObjectType!Class) {
         import std.algorithm;
-        if (is(Class == class) && !allConcreteTypeQueries.canFind(queryString!Class))
+        if (bindClass) {
+            assert(is(Class == class)); //todo proper exception
             this.bind!(Class, ScopeClass)();
-            
+        }
         this.bind!(Type)(queryString!Class());
     }
 
@@ -537,5 +514,10 @@ class Dejector {
     
     Optional!string resolveQuery(string query){
         return resolveBinding(query).map!(x => x.key).toOptional;
+    }
+    
+    bool isAlias(string query){
+        auto resolved = resolveQuery(query);
+        return resolved != query.some;
     }
 }
