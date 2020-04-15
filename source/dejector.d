@@ -2,6 +2,9 @@ import std.functional : toDelegate;
 import std.meta: staticMap, Alias;
 import std.string : join;
 import std.traits : fullyQualifiedName, hasMember, moduleName, ParameterTypeTuple, Parameters;
+import std.algorithm: canFind, map, remove;
+
+import optional;
 
 extern (C) Object _d_newclass(const TypeInfo_Class ci);
 
@@ -47,7 +50,7 @@ class Initialization {
 }
 
 interface Provider {
-    Initialization get();
+    Initialization get(Dejector dejector);
 }
 
 private string callCtor(T)(){
@@ -79,29 +82,25 @@ class ClassInitializer(T): Initializer {
 }
 
 class ClassProvider(T) : Provider {
-    private Dejector dej;
-    this(Dejector dejector) {
-        this.dej = dejector;
-    }
-    
-    override Initialization get(){
+    //todo tracing dejector instance here could be actually useful
+    override Initialization get(Dejector dejector){
         traceWiring("Building instance of type ", fullyQualifiedName!T);
         auto instance = cast(T) _d_newclass(T.classinfo);
         traceWiring("Built uninitialized instance ", &instance, " of type ", fullyQualifiedName!T);
-        return new Initialization(instance, false, new ClassInitializer!T(dej));
+        return new Initialization(instance, false, new ClassInitializer!T(dejector));
     }
 }
 
 
 class FunctionProvider : Provider {
-    private Object delegate() provide;
+    private Object delegate(Dejector) provide;
 
-    this(Object delegate() provide) {
+    this(Object delegate(Dejector) provide) {
         this.provide = provide;
     }
 
-    Initialization get() {
-        return new Initialization(provide(), true, new NullInitializer);
+    Initialization get(Dejector dejector) {
+        return new Initialization(provide(dejector), true, new NullInitializer);
     }
 }
 
@@ -113,32 +112,50 @@ class InstanceProvider : Provider {
         this.instance = instance;
     }
 
-    Initialization get() {
+    Initialization get(Dejector dejector) {
         return new Initialization(instance, true, new NullInitializer);
     }
 }
 
+mixin template DefaultScope(bool onAttached=true, bool onDetached=true){
+    Dejector context;
+
+    void onScopeInit(Dejector scopeContext) {
+        context = scopeContext;
+    }
+    static if (onAttached)
+        void onParentAttached() {}
+    static if (onDetached)
+        void onParentDetaching() {}
+}
 
 interface Scope {
     Object get(string key, Provider provider);
+    //just after instance creation
+    void onScopeInit(Dejector scopeContext);
+    //every time parent dejector changes from null to non-null
+    void onParentAttached();
+    //every time parent dejector changes from non-null to null
+    void onParentDetaching();
 }
 
-//todo IMO it's Prototype
 class NoScope : Scope {
+    mixin DefaultScope;
     Object get(string key, Provider provider) {
         traceWiring("NoScope for key ", key);
-        return provider.get().ensureInitialized.instance;
+        return provider.get(context).ensureInitialized.instance;
     }
 }
 
 class Singleton : Scope {
+    mixin DefaultScope!(true, false);
     private Object[string] instances;
 
     Object get(string key, Provider provider) {
         traceWiring("Singleton for key ", key);
         if(key !in this.instances) {
             traceWiring("Not cached for key ", key);
-            auto i = provider.get();
+            auto i = provider.get(context);
             this.instances[key] = i.instance;
             traceWiring("Cached ", key, " with ", &(i.instance));
             i.ensureInitialized;
@@ -147,6 +164,11 @@ class Singleton : Scope {
         }
         traceWiring("Singleton ", key, " -> ", key in instances);
         return this.instances[key];
+    }
+    
+    void onParentDetaching(){
+        Object[string] newInstances;
+        instances = newInstances;
     }
 }
 
@@ -182,13 +204,18 @@ string queryString(T)(T t) if (is(T == enum)) {
 }
 
 class Dejector {
+    alias ScopeResolver = Optional!Scope delegate(string);
+
     private struct Binding {
         string key;
         Provider provider;
-        Scope scope_;
+        string scopeKey;
         
-        Object get(){
-            return scope_.get(key, provider);
+        Object get(ScopeResolver resolver){
+            auto scope_ = resolver(scopeKey);
+            if (scope_.empty)
+                throw new DejectorException("Cannot resolve scope key "~scopeKey);
+            return scope_.front().get(key, provider);
         }
     }
     
@@ -253,11 +280,16 @@ class Dejector {
         }
     }
     
-    //todo private; public for debugging
-    ResolverMapping resolvers;
+    private string name;
+    private ResolverMapping resolvers;
     private Scope[string] scopes;
+    private Dejector _parent;
+    private Dejector[] _children;
 
     this(Module[] modules) {
+        import std.conv:to;
+        import std.uuid: randomUUID;
+        name = to!string(randomUUID());
         resolvers = new ResolverMapping();
         this.bindScope!NoScope;
         this.bindScope!Singleton;
@@ -271,10 +303,87 @@ class Dejector {
         this([]);
     }
     
+    override string toString(){
+        import std.conv:to;
+        return typeof(this).stringof~
+                    "(name="~name~
+                    ", resolvers.length="~to!string(resolvers.backend.length)~
+                    ", concreteTypes.length="~to!string(allConcreteTypeQueries.length)~
+                    ", parent="~to!string(_parent)~
+                    ")";
+    }
+    
+    @property
+    Dejector parent(){
+        return _parent;
+    }
+    
+    @property
+    void parent(Dejector newParent){
+        if (_parent !is newParent) {
+            detachParent();
+            if (newParent !is null){
+                attachParent(newParent);
+            }
+        }
+    }
+    
+    //works the same way whether parent was null or not; if it was non-null, all the callbacks are called
+    void detachParent(){
+        if (_parent !is null) {
+            onParentDetaching();
+            //fixme jesus, there has got to be a better way to remove an element, hasnt it?
+            Dejector[] newChildren;
+            foreach (c; _parent._children)
+                if (c !is this)
+                    newChildren ~= c;
+            _parent._children = newChildren;
+        }
+        _parent = null;
+    }
+    
+    // can assume that that really is NEW parent, previous one was null and yet previous was fully detached
+    private void attachParent(Dejector newParent){
+        checkCyclicRelationship(newParent);
+        _parent = newParent;
+        _parent._children ~= this;
+        onParentAttached();
+    }
+    
+    private void checkCyclicRelationship(Dejector d){
+        Dejector looped = d;
+        while (looped.parent !is null) {
+            if (looped.parent is this) { //todo could count loop runs and show it in exception too
+                import std.conv: to;
+                throw new DejectorException("Setting this parent would result in cyclic parent relationship (this="~to!string(this)~", proposedParent="~to!string(d)~")");
+            }
+            looped = looped.parent;
+        }
+    }
+    
+    protected void onParentAttached(){
+        foreach (s; scopes.values)
+            s.onParentAttached();
+        thisMayHaveChanged();
+    }
+    
+    protected void onParentDetaching(){
+        foreach (s; scopes.values)
+            s.onParentDetaching();
+        thisMayHaveChanged();
+    }
+    
+    private void thisMayHaveChanged(){
+        foreach (c; _children){
+            c.detachParent();
+            c.attachParent(this);
+        }
+    }
+    
     struct BindingAlias {string name; string target;}
     
     @property
-    string[] allQueries(){
+    string[] allNonInheritedQueries(){
         return resolvers.backend.keys();
     }
     
@@ -290,6 +399,8 @@ class Dejector {
         return result;
     }
     
+    //todo shadowedQueries, inheritedQueries, introducedQueried
+    
     @property
     BindingAlias[] aliasing(){
         BindingAlias[] result;
@@ -301,20 +412,44 @@ class Dejector {
         }
         return result;
     }
+    
+    //todo shadowed/inherited/introduced aliasing?
 
-    void bindScope(Class)() {
+    void bindScope(Class: Scope)() {
         immutable scopeQuery = queryString!Class();
         if(scopeQuery in this.scopes) {
             throw new DejectorException("Scope "~scopeQuery~" already bound");
         }
-        this.scopes[scopeQuery] = new Class();
+        auto newScope = new Class();
+        newScope.onScopeInit(this);
+        this.scopes[scopeQuery] = newScope;
+    }
+    
+    private Optional!Scope findScope(string key){
+        if (key in scopes)
+            return scopes[key].some;
+        if (_parent !is null){
+            return _parent.findScope(key);
+        } else {
+            return no!Scope;
+        }
+    }
+    
+    private void bind(string query, BindingResolver resolver, lazy string exc){
+        if (query in this.resolvers.backend) {
+            throw new DejectorException(exc);
+        }
+        this.resolvers.backend[query] = resolver;
+    }
+    
+    private void bind(Type)(BindingResolver resolver) if (isObjectType!Type) {
+        immutable query = queryString!Type();
+        bind(query, resolver, "Type "~query~" already bound!");
     }
 
     void bind(string alias_, string for_) {
-        if (alias_ in this.resolvers.backend) {
-            throw new DejectorException("Alias "~alias_~" for "~for_~"already bound!");
-        }
-        this.resolvers.backend[alias_] = new AliasResolver(resolvers, alias_, for_);
+        traceWiring("Binding alias "~alias_~" -> "~for_);
+        bind(alias_, new AliasResolver(resolvers, alias_, for_), "Alias "~alias_~" for "~for_~"already bound!");
     }
     
     void bind(Qualifier)(Qualifier qualifier, string for_) if (isValueType!Qualifier) {
@@ -339,34 +474,44 @@ class Dejector {
             
         this.bind!(Type)(queryString!Class());
     }
-    
-    private void bind(Type)(BindingResolver resolver) if (isObjectType!Type) {
-        immutable query = queryString!Type();
-        if (query in this.resolvers.backend) {
-            throw new DejectorException("Type "~query~" already bound!");
-        }
-        this.resolvers.backend[query] = resolver;
-    }
 
     void bind(Type, ScopeClass:Scope = Singleton)(Provider provider) if (isObjectType!Type) {
         if (!(queryString!ScopeClass() in this.scopes))
             throw new DejectorException("Unknown scope "~queryString!ScopeClass());
-        auto scope_ = this.scopes[queryString!ScopeClass()];
-        this.bind!(Type)(new ExplicitResolver(Binding(queryString!Type(), provider, scope_)));
+        traceWiring("Binding type "~queryString!Type~" explicitly");
+        this.bind!(Type)(new ExplicitResolver(Binding(queryString!Type(), provider, queryString!ScopeClass)));
     }
     
     void bind(Class, ScopeClass:Scope = Singleton)() if (is(Class == class)){
-        this.bind!(Class, ScopeClass)(new ClassProvider!Class(this));
+        this.bind!(Class, ScopeClass)(new ClassProvider!Class);
     }
     
-    void bind(Type, ScopeClass:Scope = Singleton)(Object delegate() provide) if (isObjectType!Type) {
+    void bind(Type, ScopeClass:Scope = Singleton)(Object delegate(Dejector) provide) if (isObjectType!Type) {
         this.bind!(Type, ScopeClass)(new FunctionProvider(provide));
     }
 
-    void bind(Type, ScopeClass:Scope = Singleton)(Object function() provide) if (isObjectType!Type) {
+    void bind(Type, ScopeClass:Scope = Singleton)(Object function(Dejector) provide) if (isObjectType!Type) {
         this.bind!(Type, ScopeClass)(toDelegate(provide));
     }
-
+    
+    private Optional!BindingResolver findBindingResolver(string query){
+        traceWiring("Looking for binding resolver for "~query);
+        if (query in this.resolvers.backend){
+            traceWiring("Found it locally");
+            return this.resolvers.backend[query].some;
+        }
+        if (_parent !is null) {
+            traceWiring("Delegating to parent");
+            return _parent.findBindingResolver(query);
+        }
+        traceWiring("Couldn't find at all");
+        return no!BindingResolver;
+    }
+    
+    private Optional!Binding resolveBinding(string query){
+        return findBindingResolver(query).map!((x) => x.resolve()).toOptional;
+    }
+    
     Type get(Type)() {
         return get!(Type)(queryString!Type());
     }
@@ -379,23 +524,18 @@ class Dejector {
         return get!(Type)(queryString(qualifier));
     }
     
-    private Binding resolveBinding(string query){
-        return this.resolvers.backend[query].resolve();
-    }
-    
     Type get(Type)(string query){
-        import std.algorithm: canFind;
-        if (!allQueries.canFind(query))
-            return null;
         auto binding = resolveBinding(query);
-        return cast(Type) binding.get(); 
+        if (binding.empty)
+            return null;
+        return cast(Type) binding.front().get(toDelegate(&this.findScope)); 
     }
     
-    string resolveQuery(Type)(){
+    Optional!string resolveQuery(Type)(){
         return resolveQuery(queryString!Type());
     }
     
-    string resolveQuery(string query){
-        return this.resolvers.backend[query].resolve().key;
+    Optional!string resolveQuery(string query){
+        return resolveBinding(query).map!(x => x.key).toOptional;
     }
 }

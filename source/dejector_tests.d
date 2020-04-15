@@ -26,7 +26,7 @@ version(unittest) {
             void configure(Dejector dejector) {
                 dejector.bind!(X);
                 dejector.bind!(Greeter, GreeterImplementation);
-                dejector.bind!(User)(function() { return new User("root"); });
+                dejector.bind!(User)(function(Dejector dejector) { return new User("root"); });
             }
         }
 
@@ -307,3 +307,97 @@ version(unittest) {
     }
 }
 
+
+//parent contexts
+version(unittest) {
+    interface Int1 {
+        int foo();
+    }
+    
+    class Impl1: Int1 {
+        int foo(){
+            return 1;
+        }
+    }
+    
+    class Impl2: Int1 {
+        int foo(){
+            return 2;
+        }
+    }
+    
+    class Impl3: Int1 {
+        int foo(){
+            return 3;
+        }
+    }
+    
+    class Owner {
+        Int1 impl;
+        this(Int1 i){
+            impl = i;
+        }
+        
+        int bar(){
+            return impl.foo();
+        }
+    }
+    
+    class InheritanceModule1: Module {
+        void configure(Dejector dejector){
+            dejector.bind!(Owner);
+            dejector.bind!(Int1, Impl1);
+        }
+    }
+    
+    class InheritanceModule2: Module {
+        void configure(Dejector dejector){
+            dejector.bind!(Int1, Impl2);
+        }
+    }
+    
+    class InheritanceModule3: Module {
+        void configure(Dejector dejector){
+            dejector.bind!(Int1, Impl3);
+        }
+    }
+    
+    unittest {
+        auto d1 = new Dejector([new InheritanceModule1]);
+        auto o1 = d1.get!Owner();
+        assert(o1.bar() == 1);
+        auto d2 = new Dejector([new InheritanceModule2]);
+        d2.parent = d1;
+        auto o2 = d2.get!Owner();
+        assert(o2.bar() == 2);
+        auto d3 = new Dejector([new InheritanceModule3]);
+        d3.parent = d2;
+        auto o3 = d3.get!Owner;
+        assert(o3.bar() == 3);
+        
+        d2.detachParent();
+        d2.bind!(Owner);
+        auto o2Again = d2.get!Owner();
+
+        assert(o2Again.bar() == 2);
+        assert(o2 !is o2Again);
+
+        auto o3Again = d3.get!Owner();
+        assert(o3Again.bar() == 3);
+        assert(o3 !is o3Again);
+        
+        d3.parent = d2;
+        auto o3Third = d3.get!Owner();
+        assert(o3Third is o3Again);
+        
+        d3.parent = null;
+        d3.parent = d2;
+        auto o34 = d3.get!Owner();
+        assert(o34.bar() == 3);
+        assert(o34 !is o3Third);
+        
+        //todo test cyclic parent relationship
+        
+        writeln("Inheritance passed");
+    }
+}
