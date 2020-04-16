@@ -186,8 +186,8 @@ class DejectorException: Exception {
     }
 }
 
-private enum isObjectType(T) = is(T == interface) || is(T == class);
-private enum isValueType(T) = is(T == struct) || is(T==enum);
+enum isObjectType(T) = is(T == interface) || is(T == class);
+enum isValueType(T) = is(T == struct) || is(T==enum);
 
 string queryString(T)() if (isObjectType!T) {
     return fullyQualifiedName!T;
@@ -452,7 +452,15 @@ class Dejector {
         this.bind!(Type)(queryString!Class());
     }
 
+    void bind(ScopeClass:Scope = Singleton)(string query, Provider provider){
+        if (!(queryString!ScopeClass() in this.scopes))
+            throw new DejectorException("Unknown scope "~queryString!ScopeClass());
+        traceWiring("Binding query "~query~" explicitly");
+        this.bind(query, new ExplicitResolver(Binding(query, provider, queryString!ScopeClass)), "Query "~query~" already bound!");
+    }
+
     void bind(Type, ScopeClass:Scope = Singleton)(Provider provider) if (isObjectType!Type) {
+        //todo this is a bit too copypasted
         if (!(queryString!ScopeClass() in this.scopes))
             throw new DejectorException("Unknown scope "~queryString!ScopeClass());
         traceWiring("Binding type "~queryString!Type~" explicitly");
@@ -514,6 +522,10 @@ class Dejector {
     
     Optional!string resolveQuery(string query){
         return resolveBinding(query).map!(x => x.key).toOptional;
+    }
+    
+    bool canResolve(string query){
+        return !findBindingResolver(query).empty;
     }
     
     bool isAlias(string query){
